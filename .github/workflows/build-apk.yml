@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - "Jarvis-Engineering-Pass-0.2.zip"
+      - "Jarvis-Engineering-Pass-0.2-FINAL.zip"
       - ".github/workflows/build-apk.yml"
 
 permissions:
