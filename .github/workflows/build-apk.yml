@@ -1,19 +1,46 @@
-name: Build Latest Jarvis ZIP
+name: Jarvis APK Builder
 
 on:
   workflow_dispatch:
+    inputs:
+      zip_name:
+        description: "Kaunsi zip build karni hai (repo ka path). Khali = sabse nayi zip"
+        required: false
+        default: ""
+      run_tests:
+        description: "APK banne ke baad unit tests chalao"
+        type: boolean
+        default: true
+      publish_release:
+        description: "APK ko GitHub Release mein daalo (phone se direct download)"
+        type: boolean
+        default: true
   push:
     paths:
       - "**.zip"
       - ".github/workflows/build-apk.yml"
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: jarvis-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_VERSION: "9.6.0"
+  JAVA_VERSION: "17"
+  KEEP_RELEASES: "10"
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
-    name: Build Latest Jarvis APK
+    name: Build Jarvis APK
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     steps:
       - name: Checkout repository
@@ -21,102 +48,207 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Find latest ZIP
-        shell: bash
+      - name: Pick the ZIP to build
+        env:
+          REQUESTED_ZIP: ${{ github.event.inputs.zip_name }}
         run: |
           set -euo pipefail
           latest_zip=""
-          latest_time=0
-
-          while IFS= read -r -d '' zip; do
-            commit_time="$(git log -1 --format=%ct -- "$zip" 2>/dev/null || echo 0)"
-            echo "ZIP: $zip | commit: $commit_time"
-            if [ "$commit_time" -ge "$latest_time" ]; then
-              latest_time="$commit_time"
-              latest_zip="$zip"
+          if [ -n "${REQUESTED_ZIP:-}" ]; then
+            if ! git ls-files --error-unmatch -- "$REQUESTED_ZIP" >/dev/null 2>&1; then
+              echo "::error::Requested zip not found in repo: $REQUESTED_ZIP"
+              exit 1
             fi
-          done < <(git ls-files -z -- '*.zip')
-
+            latest_zip="$REQUESTED_ZIP"
+          else
+            latest_time=0
+            while IFS= read -r -d '' z; do
+              t="$(git log -1 --format=%ct -- "$z" 2>/dev/null || echo 0)"
+              echo "  $z (commit time: $t)"
+              if [ "$t" -ge "$latest_time" ]; then
+                latest_time="$t"
+                latest_zip="$z"
+              fi
+            done < <(git ls-files -z -- '*.zip')
+          fi
           if [ -z "$latest_zip" ]; then
-            echo "ERROR: No ZIP file found in repository."
+            echo "::error::Repo mein koi .zip nahi mili"
             exit 1
           fi
-
-          echo "Selected latest ZIP: $latest_zip"
+          echo "Selected ZIP: $latest_zip"
           echo "ZIP_FILE=$latest_zip" >> "$GITHUB_ENV"
 
-      - name: Extract Jarvis project
-        shell: bash
+      - name: Extract and locate the Android project
         run: |
           set -euo pipefail
           rm -rf jarvis-build
           mkdir -p jarvis-build
-          echo "Extracting: $ZIP_FILE"
-          unzip -q "$ZIP_FILE" -d jarvis-build
+          unzip -q -o "$ZIP_FILE" -d jarvis-build
           find jarvis-build -type d -exec chmod 755 {} +
           find jarvis-build -type f -exec chmod 644 {} +
-          echo "Extraction successful."
-
-      - name: Locate Android project
-        shell: bash
-        run: |
-          set -euo pipefail
-          settings_file="$(find jarvis-build -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print -quit)"
-          if [ -z "$settings_file" ]; then
-            echo "ERROR: Android Gradle project not found."
+          # The top-most settings.gradle(.kts) is the project root (works with or without a wrapper folder).
+          settings="$(find jarvis-build -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) \
+            -not -path '*/__MACOSX/*' | awk '{ print length, $0 }' | sort -n | head -1 | cut -d' ' -f2-)"
+          if [ -z "$settings" ]; then
+            echo "::error::Zip ke andar Android Gradle project nahi mila"
             exit 1
           fi
-          project_dir="$(dirname "$settings_file")"
-          echo "Android project: $project_dir"
-          echo "PROJECT_DIR=$project_dir" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$(dirname "$settings")" >> "$GITHUB_ENV"
+          echo "Android project: $(dirname "$settings")"
 
-      - name: Source preflight
+      - name: Source preflight (if the project ships one)
         working-directory: ${{ env.PROJECT_DIR }}
-        run: python3 tools/preflight.py
+        run: |
+          if [ -f tools/preflight.py ]; then
+            python3 tools/preflight.py
+          else
+            echo "No tools/preflight.py, skipping."
+          fi
 
-      - name: Set up JDK 17
+      - name: Set up JDK
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Set up Gradle 9.6.0
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
-          gradle-version: '9.6.0'
+          gradle-version: ${{ env.GRADLE_VERSION }}
 
-      - name: Build Debug APK
+      - name: Make sure the Android SDK platform is installed
         working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle assembleDebug --stacktrace
-
-      - name: Verify APK
-        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
         run: |
-          set -euo pipefail
-          find app/build/outputs/apk -type f -name '*.apk' -print
-          if [ "$(find app/build/outputs/apk -type f -name '*.apk' | wc -l)" -eq 0 ]; then
-            echo 'ERROR: APK was not generated.'
-            exit 1
+          set +e
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          [ -n "$sdk" ] || { echo "ANDROID_HOME not set, letting Gradle handle it"; exit 0; }
+          cs="$(grep -oP 'compileSdk\s*=\s*\K[0-9]+' app/build.gradle.kts | head -1)"
+          [ -n "$cs" ] || exit 0
+          if [ -d "$sdk/platforms/android-$cs" ]; then echo "Platform $cs already installed"; exit 0; fi
+          sm="$sdk/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$sm" ] || sm="$(command -v sdkmanager)"
+          [ -n "$sm" ] || { echo "sdkmanager not found"; exit 0; }
+          yes | "$sm" --licenses >/dev/null 2>&1
+          "$sm" "platforms;android-$cs" || "$sm" "platforms;android-$cs.0" || true
+
+      # Same signing key on every build => new APK installs OVER the old one (no uninstall needed).
+      - name: Restore stable debug signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: jarvis-debug-keystore-v1
+
+      - name: Use permanent keystore from secret (optional)
+        env:
+          KS_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "${KS_B64:-}" ]; then
+            mkdir -p ~/.android
+            echo "$KS_B64" | base64 -d > ~/.android/debug.keystore
+            echo "Using keystore from secret DEBUG_KEYSTORE_B64"
+          else
+            echo "No DEBUG_KEYSTORE_B64 secret: using the cached debug key"
           fi
 
-      - name: Upload APK
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          gradle assembleDebug --stacktrace --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Explain the failure (paste this to your assistant)
+        if: failure()
+        run: |
+          {
+            echo "## Build failed"
+            echo "Zip: $ZIP_FILE"
+            echo
+            echo "### First errors"
+            echo '```'
+            grep -E "^e: |^error: |FAILURE: Build failed|What went wrong" -A4 build.log | head -80 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-debug-apk
-          path: '${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk'
+          name: Jarvis-build-failure-${{ github.run_number }}
+          path: |
+            build.log
+            ${{ env.PROJECT_DIR }}/app/build/reports
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Collect and name the APK
+        run: |
+          set -euo pipefail
+          src="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" -type f -name '*.apk' | head -1)"
+          if [ -z "$src" ]; then
+            echo "::error::APK generate nahi hui"
+            exit 1
+          fi
+          ver="$(grep -oP 'versionName\s*=\s*"\K[^"]+' "$PROJECT_DIR/app/build.gradle.kts" | head -1 || true)"
+          ver="${ver:-0}"
+          name="Jarvis-v${ver}-build${{ github.run_number }}.apk"
+          mkdir -p dist
+          cp "$src" "dist/$name"
+          sha="$(sha256sum "dist/$name" | cut -d' ' -f1)"
+          size="$(du -h "dist/$name" | cut -f1)"
+          {
+            echo "APP_VERSION=$ver"
+            echo "APK_PATH=dist/$name"
+            echo "APK_NAME=$name"
+            echo "APK_SHA=$sha"
+          } >> "$GITHUB_ENV"
+          {
+            echo "## Jarvis APK ready"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Zip used | $ZIP_FILE |"
+            echo "| Version | $ver (build ${{ github.run_number }}) |"
+            echo "| APK | $name ($size) |"
+            echo "| SHA-256 | $sha |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-APK-${{ github.run_number }}
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 14
 
-      - name: Unit tests (does not block the APK)
+      - name: Publish GitHub Release (direct .apk download on phone)
+        if: github.event_name != 'workflow_dispatch' || inputs.publish_release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="build-${{ github.run_number }}"
+          gh release create "$tag" "$APK_PATH" \
+            --target "$GITHUB_SHA" \
+            --title "Jarvis v${APP_VERSION} (build ${{ github.run_number }})" \
+            --notes "Built from $ZIP_FILE | commit ${GITHUB_SHA::7} | SHA-256 $APK_SHA"
+          # Keep only the newest releases so the repo does not fill up.
+          { gh release list --limit 200 --json tagName --jq '.[].tagName' \
+              | grep '^build-' \
+              | tail -n +$((KEEP_RELEASES + 1)) \
+              | while read -r old; do gh release delete "$old" --cleanup-tag --yes || true; done; } || true
+
+      - name: Unit tests (never blocks the APK)
+        if: github.event_name != 'workflow_dispatch' || inputs.run_tests
         working-directory: ${{ env.PROJECT_DIR }}
         continue-on-error: true
-        run: gradle testDebugUnitTest --stacktrace
+        run: gradle testDebugUnitTest --stacktrace --console=plain
 
       - name: Upload test report
-        if: always()
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.run_tests)
         uses: actions/upload-artifact@v4
         with:
-          name: Jarvis-test-report
-          path: '${{ env.PROJECT_DIR }}/app/build/reports/tests/testDebugUnitTest'
+          name: Jarvis-test-report-${{ github.run_number }}
+          path: ${{ env.PROJECT_DIR }}/app/build/reports/tests/testDebugUnitTest
           if-no-files-found: ignore
           retention-days: 7
